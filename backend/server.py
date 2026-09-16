@@ -960,7 +960,7 @@ async def lifespan(app: FastAPI):
         if changed:
             await db.tenant_modules.update_one({"_id": tm["_id"]}, {"$set": {"modules": mods}})
     tasks = [
-        asyncio.create_task(telemetry_simulator()),
+        # asyncio.create_task(telemetry_simulator()),  # disabled - using real Node-RED input
         asyncio.create_task(escalation_scanner()),
     ]
     try:
