@@ -34,7 +34,7 @@ from fastapi import (
     status,
 )
 from fastapi.security import OAuth2PasswordBearer
-from motor.motor_asyncio import AsyncIOMotorClient
+from pg_db import PostgresDB, create_pool
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, Field
 from starlette.middleware.cors import CORSMiddleware
@@ -45,8 +45,7 @@ load_dotenv(ROOT_DIR / ".env")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("coreot")
 
-MONGO_URL = os.environ["MONGO_URL"]
-DB_NAME = os.environ["DB_NAME"]
+POSTGRES_URL = os.environ["POSTGRES_URL"]  # e.g. postgresql://user:pass@host:5432/coreot
 JWT_SECRET = os.environ.get("JWT_SECRET", "coreot-dev-secret-change-me")
 JWT_ALG = "HS256"
 JWT_EXPIRES_MIN = 60 * 24 * 7  # 7 days
@@ -120,8 +119,7 @@ def ensure_ingest_key() -> str:
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-client = AsyncIOMotorClient(MONGO_URL)
-db = client[DB_NAME]
+db: "PostgresDB" = None  # set during lifespan startup (asyncpg pool is async)
 
 oauth2 = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 
@@ -938,14 +936,14 @@ async def escalation_scanner() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global db
+    pool = await create_pool(POSTGRES_URL)
+    db = PostgresDB(pool)
+    # Note: tables/indexes are created ahead of time by running schema.sql
+    # against your Postgres/TimescaleDB instance (see schema.sql in this
+    # folder) — there's no per-startup index creation needed here anymore.
     ensure_ingest_key()
     await seed_database()
-    # Ensure indexes
-    await db.telemetry.create_index([("asset_id", 1), ("ts", -1)])
-    await db.alarms.create_index([("tenant_id", 1), ("created_at", -1)])
-    await db.assets.create_index([("tenant_id", 1)])
-    await db.escalations.create_index([("tenant_id", 1), ("escalated_at", -1)])
-    await db.tenant_modules.create_index("tenant_id", unique=True)
     # Backfill: ensure REPORTS module is enabled for existing tenants (idempotent)
     async for tm in db.tenant_modules.find({}):
         mods = tm.get("modules", {}) or {}
@@ -958,7 +956,7 @@ async def lifespan(app: FastAPI):
             mods["REPORTS"] = True
             changed = True
         if changed:
-            await db.tenant_modules.update_one({"_id": tm["_id"]}, {"$set": {"modules": mods}})
+            await db.tenant_modules.update_one({"tenant_id": tm["tenant_id"]}, {"$set": {"modules": mods}})
     tasks = [
         # asyncio.create_task(telemetry_simulator()),  # disabled - using real Node-RED input
         asyncio.create_task(escalation_scanner()),
@@ -968,7 +966,7 @@ async def lifespan(app: FastAPI):
     finally:
         for t in tasks:
             t.cancel()
-        client.close()
+        await pool.close()
 
 
 app = FastAPI(title="CoreOT APM API", lifespan=lifespan)
